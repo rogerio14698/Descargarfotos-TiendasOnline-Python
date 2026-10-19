@@ -1,0 +1,314 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+descargar.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="descargar.py">
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Descarga todas las fotos de una colección de una tienda Shopify y crea una
+ficha técnica para cada foto, con el mismo número que la imagen.
+
+Resultado (carpeta "nuddy_fotos" por defecto):
+    imagenes/img_001.jpg, img_002.jpg, ...      <- las fotos
+    fichas/img_001.txt,  img_002.txt,  ...      <- ficha técnica de cada foto
+    fichas_tecnicas.csv                         <- todas las fichas en una tabla (Excel)
+    errores.txt                                 <- solo si alguna descarga falla
+
+Uso (solo necesitas Python 3, no hay que instalar nada más):
+    python descargar_fotos.py
+    python descargar_fotos.py --todos        (incluye también productos agotados)
+
+Si la descarga se corta, vuelve a ejecutarlo: salta las fotos ya descargadas.
+"""
+import argparse
+import csv
+import json
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlparse
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+# ----------------------------------------------------------------- red ------
+def leer(url, binario=False, reintentos=3):
+    ultimo = None
+    for intento in range(1, reintentos + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                datos = r.read()
+            return datos if binario else datos.decode("utf-8")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            ultimo = e
+            time.sleep(1.5 * intento)
+    raise RuntimeError(f"No se pudo leer {url}: {ultimo}")
+
+
+def obtener_productos(base, coleccion):
+    productos, vistos, pagina = [], set(), 1
+    while pagina <= 50:
+        url = f"{base}/collections/{coleccion}/products.json?limit=250&page={pagina}"
+        lote = json.loads(leer(url)).get("products", [])
+        nuevos = [p for p in lote if p["id"] not in vistos]
+        if not nuevos:
+            break
+        for p in nuevos:
+            vistos.add(p["id"])
+        productos += nuevos
+        print(f"  página {pagina}: {len(nuevos)} productos")
+        pagina += 1
+        time.sleep(0.5)
+    return productos
+
+
+# ------------------------------------------------------ texto de la ficha ---
+class _HtmlATexto(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.partes = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("br", "p", "li", "div"):
+            self.partes.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("p", "li", "div"):
+            self.partes.append("\n")
+
+    def handle_data(self, data):
+        self.partes.append(data)
+
+
+def html_a_lineas(html):
+    p = _HtmlATexto()
+    p.feed(html or "")
+    p.close()
+    texto = "".join(p.partes).replace("\xa0", " ")
+    lineas = [re.sub(r"[ \t]+", " ", l).strip() for l in texto.split("\n")]
+    return [l for l in lineas if l]
+
+
+def datos_producto(p):
+    composicion, medidas, descripcion, modelo = [], [], [], ""
+    for l in html_a_lineas(p.get("body_html")):
+        bajo = l.lower()
+        if bajo.startswith("composi"):
+            composicion.append(re.sub(r"^composi[çc][ãa]o:?\s*", "", l, flags=re.I))
+        elif re.match(r"^[-–]\s*\S", l) and ":" in l:
+            medidas.append(l.lstrip("-– ").strip())
+        elif bajo.startswith("medidas"):
+            continue
+        elif "o modelo tem" in bajo:
+            modelo = l.strip("“”\" ")
+        else:
+            descripcion.append(l)
+
+    variantes = p.get("variants", [])
+    disponibles = [v["title"] for v in variantes if v.get("available")]
+    agotadas = [v["title"] for v in variantes if not v.get("available")]
+
+    sku_base = ""
+    if variantes:
+        v0 = variantes[0]
+        t = (v0.get("title") or "").replace(" ", "")
+        sku = v0.get("sku") or ""
+        sku_base = sku[:-len(t)] if t and sku.endswith(t) else sku
+
+    precios = [float(v["price"]) for v in variantes if v.get("price")]
+    antes = [float(v["compare_at_price"]) for v in variantes if v.get("compare_at_price")]
+
+    return {
+        "producto": p.get("title", ""),
+        "tipo": p.get("product_type", ""),
+        "etiquetas": ", ".join(p.get("tags", [])),
+        "sku_base": sku_base,
+        "precio_brl": f"{min(precios):.2f}" if precios else "",
+        "precio_antes_brl": f"{max(antes):.2f}" if antes else "",
+        "tallas_disponibles": ", ".join(disponibles),
+        "tallas_agotadas": ", ".join(agotadas),
+        "composicion": " / ".join(composicion),
+        "medidas": " || ".join(medidas),
+        "modelo": modelo,
+        "descripcion": " ".join(descripcion),
+        "url_producto": f"__BASE__/products/{p.get('handle', '')}",
+    }
+
+
+def construir_fichas(productos, base, solo_disponibles=True):
+    filas = []
+    for p in productos:
+        if solo_disponibles and not any(v.get("available") for v in p.get("variants", [])):
+            continue
+        d = datos_producto(p)
+        d["url_producto"] = d["url_producto"].replace("__BASE__", base)
+        imagenes = sorted(p.get("images", []), key=lambda i: i.get("position", 0))
+        for im in imagenes:
+            f = dict(d)
+            f["foto_del_producto"] = f"{im.get('position', len(filas) + 1)} de {len(imagenes)}"
+            f["ancho_px"] = im.get("width", "")
+            f["alto_px"] = im.get("height", "")
+            f["url_imagen_original"] = im["src"]
+            filas.append(f)
+    ancho = max(3, len(str(len(filas))))
+    for n, f in enumerate(filas, 1):
+        ext = Path(urlparse(f["url_imagen_original"]).path).suffix.lower() or ".jpg"
+        f["img"] = f"img_{n:0{ancho}d}"
+        f["archivo_imagen"] = f"{f['img']}{ext}"
+    return filas
+
+
+COLUMNAS = [
+    "img", "archivo_imagen", "producto", "tipo", "foto_del_producto", "sku_base",
+    "precio_brl", "precio_antes_brl", "tallas_disponibles", "tallas_agotadas",
+    "composicion", "medidas", "modelo", "descripcion", "etiquetas",
+    "ancho_px", "alto_px", "url_producto", "url_imagen_original",
+]
+
+
+def texto_ficha(f):
+    medidas = "\n".join("  - " + m for m in f["medidas"].split(" || ") if m) or "  (no indicadas)"
+    return (
+        f"FICHA TÉCNICA — {f['img']}\n"
+        f"{'=' * 40}\n"
+        f"Archivo de la foto : imagenes/{f['archivo_imagen']}\n"
+        f"Foto               : {f['foto_del_producto']} de este producto\n"
+        f"Producto           : {f['producto']}\n"
+        f"Tipo               : {f['tipo']}\n"
+        f"SKU base           : {f['sku_base']}\n"
+        f"Precio (BRL)       : {f['precio_brl']}"
+        + (f"  (antes {f['precio_antes_brl']})" if f["precio_antes_brl"] else "") + "\n"
+        f"Tallas disponibles : {f['tallas_disponibles'] or '-'}\n"
+        f"Tallas agotadas    : {f['tallas_agotadas'] or '-'}\n"
+        f"Composición        : {f['composicion'] or '-'}\n"
+        f"Modelo             : {f['modelo'] or '-'}\n"
+        f"Etiquetas          : {f['etiquetas'] or '-'}\n"
+        f"Resolución         : {f['ancho_px']} x {f['alto_px']} px\n"
+        f"Medidas (por talla):\n{medidas}\n"
+        f"\nDescripción:\n{f['descripcion'] or '-'}\n"
+        f"\nPágina del producto: {f['url_producto']}\n"
+        f"Imagen original    : {f['url_imagen_original']}\n"
+    )
+
+
+# ----------------------------------------------------------------- main -----
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url", default="https://nuddystudio.com.br", help="dirección de la tienda")
+    ap.add_argument("--coleccion", default="new-nuddys", help="nombre (handle) de la colección")
+    ap.add_argument("--salida", default="nuddy_fotos", help="carpeta de salida")
+    ap.add_argument("--todos", action="store_true", help="incluir también productos agotados")
+    ap.add_argument("--json", help="usar un products.json local en vez de descargarlo (pruebas)")
+    ap.add_argument("--sin-descarga", action="store_true", help="solo crear fichas, sin bajar fotos")
+    a = ap.parse_args()
+
+    base = a.url.rstrip("/")
+    print("1/3 Leyendo la colección...")
+    if a.json:
+        productos = json.loads(Path(a.json).read_text(encoding="utf-8"))["products"]
+    else:
+        productos = obtener_productos(base, a.coleccion)
+    filas = construir_fichas(productos, base, solo_disponibles=not a.todos)
+    n_prod = len({f["producto"] for f in filas})
+    print(f"    {n_prod} productos, {len(filas)} fotos")
+
+    salida = Path(a.salida)
+    (salida / "imagenes").mkdir(parents=True, exist_ok=True)
+    (salida / "fichas").mkdir(parents=True, exist_ok=True)
+
+    print("2/3 Creando fichas técnicas...")
+    for f in filas:
+        (salida / "fichas" / f"{f['img']}.txt").write_text(texto_ficha(f), encoding="utf-8")
+    with open(salida / "fichas_tecnicas.csv", "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=COLUMNAS, delimiter=";", extrasaction="ignore")
+        w.writeheader()
+        w.writerows(filas)
+
+    if a.sin_descarga:
+        print("Hecho (sin descargar fotos).")
+        return
+
+    print("3/3 Descargando fotos...")
+    errores, cache = [], {}
+    for i, f in enumerate(filas, 1):
+        destino = salida / "imagenes" / f["archivo_imagen"]
+        url = f["url_imagen_original"]
+        if destino.exists() and destino.stat().st_size > 0:
+            cache.setdefault(url, destino)
+            continue
+        try:
+            if url in cache:
+                shutil.copyfile(cache[url], destino)
+            else:
+                destino.write_bytes(leer(url, binario=True))
+                cache[url] = destino
+                time.sleep(0.3)
+        except Exception as e:  # noqa: BLE001
+            errores.append(f"{f['img']}\t{url}\t{e}")
+        if i % 10 == 0 or i == len(filas):
+            print(f"    {i}/{len(filas)}")
+
+    if errores:
+        (salida / "errores.txt").write_text("\n".join(errores), encoding="utf-8")
+        print(f"Terminado con {len(errores)} errores (ver errores.txt). Vuelve a ejecutar para reintentar.")
+    else:
+        print(f"Terminado: {len(filas)} fotos y fichas en la carpeta '{salida}'.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+</file>
+
+</files>
